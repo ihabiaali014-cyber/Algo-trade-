@@ -1,0 +1,272 @@
+//@version=6
+// Sweep → FVG HTF → Reversal  (v1)
+// Détecte : impulsion qui laisse une FVG 2m/3m/5m → retracement en micro-structure
+// inverse → sweep d'un micro swing + tap dans la FVG → entrée à la clôture de la
+// première bougie dans le sens du trade. SL sous le sweep, TP sur le high de l'impulsion.
+// À utiliser sur un graphique 1m.
+indicator("Sweep FVG Reversal [v1]", shorttitle = "SweepFVG", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpF = "FVG (unités de temps supérieures)"
+useTf1 = input.bool(true, "FVG TF 1", inline = "tf1", group = grpF)
+tf1    = input.timeframe("2", "", inline = "tf1", group = grpF)
+useTf2 = input.bool(true, "FVG TF 2", inline = "tf2", group = grpF)
+tf2    = input.timeframe("3", "", inline = "tf2", group = grpF)
+useTf3 = input.bool(true, "FVG TF 3", inline = "tf3", group = grpF)
+tf3    = input.timeframe("5", "", inline = "tf3", group = grpF)
+fvgMaxAge       = input.int(120, "Âge max d'une FVG (bougies 1m)", minval = 5, group = grpF)
+fvgMinSizeTicks = input.int(2, "Taille min d'une FVG (ticks)", minval = 0, group = grpF)
+
+grpS = "Structure"
+pivLen         = input.int(1, "Force des swings (bougies de chaque côté)", minval = 1, maxval = 5, group = grpS)
+needLH         = input.bool(true, "Exiger un lower high dans le retracement", group = grpS)
+needBreak      = input.bool(true, "Exiger la cassure d'un micro low (sweep)", group = grpS)
+maxRetraceBars = input.int(40, "Durée max du retracement (bougies)", minval = 3, group = grpS)
+maxWaitBars    = input.int(5, "Bougies max entre sweep et entrée", minval = 1, group = grpS)
+
+grpT = "Trade"
+sameBar   = input.bool(true, "Entrée possible sur la bougie du sweep elle-même", group = grpT)
+bufTicks  = input.int(2, "Buffer SL sous le sweep (ticks)", minval = 0, group = grpT)
+minRR     = input.float(1.0, "RR minimum", minval = 0.1, step = 0.1, group = grpT)
+showLong  = input.bool(true, "Longs", inline = "dir", group = grpT)
+showShort = input.bool(true, "Shorts", inline = "dir", group = grpT)
+showStats = input.bool(true, "Tableau de stats", group = grpT)
+colLong   = input.color(color.teal, "Couleur long", inline = "col", group = grpT)
+colShort  = input.color(color.maroon, "Couleur short", inline = "col", group = grpT)
+
+// ───────────────────────────── Types ─────────────────────────────
+// Toute la logique est écrite pour un LONG. Le côté short réutilise exactement le même
+// moteur sur des prix inversés (prix × -1) : un high devient un low, une FVG baissière
+// devient une FVG haussière, etc. On remultiplie par -1 uniquement pour dessiner.
+type Fvg
+    float  top
+    float  bot
+    int    bar   // bar_index où la FVG devient connue (bougie HTF clôturée)
+    int    t0    // time de la 1re bougie HTF de la FVG (pour le dessin)
+    string tf
+
+type Setup
+    int   state = 0   // 0 = suivi du high, 1 = retracement, 2 = sweep fait, 3 = en position
+    float impHigh
+    int   impBar
+    float microLow
+    bool  lhSeen = false
+    bool  broke  = false
+    float sweepLow
+    int   sweepBar
+    Fvg   fvg
+    float entry
+    float sl
+    float tp
+    int   entryBar
+
+type Stats
+    int   n    = 0
+    int   win  = 0
+    int   loss = 0
+    float r    = 0.0
+
+// ───────────────────────────── FVG HTF ─────────────────────────────
+// [1] + lookahead_on = valeurs de la dernière bougie HTF CLÔTURÉE → pas de repaint,
+// et la FVG n'est connue qu'après la clôture de sa 3e bougie.
+htfFvg() =>
+    bool bull = low[1] > high[3]
+    bool bear = high[1] < low[3]
+    [bull, low[1], high[3], bear, low[3], high[1], time[3], time[1]]
+
+[b1, bTop1, bBot1, s1, sTop1, sBot1, t01, id1] = request.security(syminfo.tickerid, tf1, htfFvg(), lookahead = barmerge.lookahead_on)
+[b2, bTop2, bBot2, s2, sTop2, sBot2, t02, id2] = request.security(syminfo.tickerid, tf2, htfFvg(), lookahead = barmerge.lookahead_on)
+[b3, bTop3, bBot3, s3, sTop3, sBot3, t03, id3] = request.security(syminfo.tickerid, tf3, htfFvg(), lookahead = barmerge.lookahead_on)
+
+var array<Fvg> bullFvgs = array.new<Fvg>()
+var array<Fvg> bearFvgs = array.new<Fvg>()   // stockées en prix inversés
+
+tfName(string tf) =>
+    str.tostring(math.round(timeframe.in_seconds(tf) / 60.0)) + "m"
+
+addFvg(array<Fvg> arr, float top, float bot, int t0, string tf) =>
+    if top - bot >= fvgMinSizeTicks * syminfo.mintick
+        arr.push(Fvg.new(top, bot, bar_index, t0, tfName(tf)))
+        if arr.size() > 30
+            arr.shift()
+
+registerFvg(bool enabled, bool isNew, bool bull, float bTop, float bBot, bool bear, float sTop, float sBot, int t0, string tf) =>
+    if enabled and isNew
+        if bull
+            addFvg(bullFvgs, bTop, bBot, t0, tf)
+        if bear
+            addFvg(bearFvgs, -sBot, -sTop, t0, tf)
+
+// Supprime les FVG invalidées (clôture à travers) ou trop vieilles
+pruneFvgs(array<Fvg> arr, float c) =>
+    int n = arr.size()
+    if n > 0
+        for i = n - 1 to 0
+            Fvg f = arr.get(i)
+            if c < f.bot or bar_index - f.bar > fvgMaxAge
+                arr.remove(i)
+
+hasFvgBelow(array<Fvg> arr, float level) =>
+    bool res = false
+    for f in arr
+        if f.top < level
+            res := true
+            break
+    res
+
+// FVG la plus récente touchée par la mèche, sans clôture à travers
+findTap(array<Fvg> arr, float l, float c, float level) =>
+    Fvg res = na
+    int n = arr.size()
+    if n > 0
+        for i = n - 1 to 0
+            Fvg f = arr.get(i)
+            if f.top < level and l <= f.top and c >= f.bot
+                res := f
+                break
+    res
+
+registerFvg(useTf1, id1 != id1[1], b1, bTop1, bBot1, s1, sTop1, sBot1, t01, tf1)
+registerFvg(useTf2, id2 != id2[1], b2, bTop2, bBot2, s2, sTop2, sBot2, t02, tf2)
+registerFvg(useTf3, id3 != id3[1], b3, bTop3, bBot3, s3, sTop3, sBot3, t03, tf3)
+pruneFvgs(bullFvgs, close)
+pruneFvgs(bearFvgs, -close)
+
+// ───────────────────────────── Moteur ─────────────────────────────
+phH = ta.pivothigh(high, pivLen, pivLen)
+plL = ta.pivotlow(low, pivLen, pivLen)
+
+resetSetup(Setup s) =>
+    s.state   := 0
+    s.impHigh := na
+
+// sgn = 1 pour long, -1 pour short. o/h/l/c/ph/pl sont déjà normalisés (inversés si short).
+step(Setup s, Stats st, array<Fvg> fvgs, float sgn, float o, float h, float l, float c, float ph, float pl, color col) =>
+    bool fired = false
+    string side = sgn > 0 ? "LONG" : "SHORT"
+
+    // 3) Position en cours → TP ou SL (si les deux dans la même bougie : SL, prudent)
+    if s.state == 3 and bar_index > s.entryBar
+        bool hitSl = l <= s.sl
+        bool hitTp = h >= s.tp
+        if hitSl or hitTp
+            float rr = (s.tp - s.entry) / (s.entry - s.sl)
+            st.n := st.n + 1
+            if hitSl
+                st.loss := st.loss + 1
+                st.r    := st.r - 1
+            else
+                st.win := st.win + 1
+                st.r   := st.r + rr
+            label.new(bar_index, sgn * (hitSl ? s.sl : s.tp), hitSl ? "SL" : "TP", style = label.style_label_left, color = hitSl ? color.red : color.green, textcolor = color.white, size = size.tiny)
+            resetSetup(s)
+
+    // 0) Suivi du plus haut. Il devient "high d'impulsion" une fois confirmé
+    //    (pivLen bougies sans le dépasser) et s'il a une FVG HTF en dessous.
+    if s.state == 0
+        if na(s.impHigh) or h > s.impHigh
+            s.impHigh := h
+            s.impBar  := bar_index
+        else if bar_index - s.impBar >= pivLen and hasFvgBelow(fvgs, s.impHigh)
+            s.state    := 1
+            s.microLow := na
+            s.lhSeen   := false
+            s.broke    := false
+
+    // 1) Retracement : lower high + micro low, puis cassure du micro low et tap FVG
+    else if s.state == 1
+        if h > s.impHigh
+            // nouveau plus haut : l'impulsion continue, on repart de zéro
+            s.impHigh  := h
+            s.impBar   := bar_index
+            s.microLow := na
+            s.lhSeen   := false
+            s.broke    := false
+        else if bar_index - s.impBar > maxRetraceBars or not hasFvgBelow(fvgs, s.impHigh)
+            resetSetup(s)
+        else
+            int pivBar = bar_index - pivLen
+            if not na(ph) and pivBar > s.impBar and ph < s.impHigh
+                s.lhSeen := true
+            if not na(pl) and pivBar > s.impBar and not s.broke
+                s.microLow := pl
+            if not s.broke and not na(s.microLow) and l < s.microLow and (s.lhSeen or not needLH)
+                s.broke := true
+            if s.broke or not needBreak
+                Fvg f = findTap(fvgs, l, c, s.impHigh)
+                if not na(f)
+                    s.state    := 2
+                    s.sweepLow := l
+                    s.sweepBar := bar_index
+                    s.fvg      := f
+
+    // 2) Sweep fait → entrée à la clôture de la 1re bougie dans le sens du trade
+    if s.state == 2
+        if bar_index > s.sweepBar
+            s.sweepLow := math.min(s.sweepLow, l)
+        if c < s.fvg.bot
+            resetSetup(s)
+        else if c > o and (sameBar or bar_index > s.sweepBar)
+            float entry = c
+            float sl    = s.sweepLow - bufTicks * syminfo.mintick
+            float tp    = s.impHigh
+            float risk  = entry - sl
+            if risk > 0 and tp > entry and (tp - entry) / risk >= minRR
+                float rr   = (tp - entry) / risk
+                s.state    := 3
+                s.entry    := entry
+                s.sl       := sl
+                s.tp       := tp
+                s.entryBar := bar_index
+                fired      := true
+
+                Fvg f = s.fvg
+                box.new(f.t0, sgn > 0 ? f.top : -f.bot, time, sgn > 0 ? f.bot : -f.top, xloc = xloc.bar_time, border_color = color.new(col, 50), bgcolor = color.new(col, 85), text = "FVG " + f.tf, text_size = size.tiny, text_color = col, text_halign = text.align_right, text_valign = text.align_bottom)
+                line.new(s.impBar, sgn * tp, bar_index, sgn * tp, style = line.style_dotted, color = color.green)
+                line.new(bar_index, sgn * tp, bar_index + 10, sgn * tp, color = color.green, width = 2)
+                line.new(bar_index, sgn * entry, bar_index + 10, sgn * entry, color = color.gray, width = 2)
+                line.new(bar_index, sgn * sl, bar_index + 10, sgn * sl, color = color.red, width = 2)
+                label.new(s.sweepBar, sgn * s.sweepLow, "sweep", style = sgn > 0 ? label.style_label_up : label.style_label_down, color = color.new(color.orange, 20), textcolor = color.white, size = size.tiny)
+                string txt = side + "\nE " + str.tostring(sgn * entry, format.mintick) + "\nSL " + str.tostring(sgn * sl, format.mintick) + "\nTP " + str.tostring(sgn * tp, format.mintick) + "\nRR " + str.tostring(rr, "#.##")
+                label.new(bar_index + 1, sgn * entry, txt, style = label.style_label_left, color = col, textcolor = color.white, size = size.small)
+                alert('{"ticker":"' + syminfo.ticker + '","side":"' + side + '","entry":' + str.tostring(sgn * entry) + ',"sl":' + str.tostring(sgn * sl) + ',"tp":' + str.tostring(sgn * tp) + '}', alert.freq_once_per_bar_close)
+            else
+                resetSetup(s)
+        else if bar_index - s.sweepBar >= maxWaitBars
+            resetSetup(s)
+    fired
+
+var Setup longS  = Setup.new()
+var Setup shortS = Setup.new()
+var Stats longSt  = Stats.new()
+var Stats shortSt = Stats.new()
+
+bool longSig  = false
+bool shortSig = false
+if showLong
+    longSig := step(longS, longSt, bullFvgs, 1.0, open, high, low, close, phH, plL, colLong)
+if showShort
+    shortSig := step(shortS, shortSt, bearFvgs, -1.0, -open, -low, -high, -close, -plL, -phH, colShort)
+
+alertcondition(longSig, "Setup LONG", "Setup long SweepFVG sur {{ticker}} à {{close}}")
+alertcondition(shortSig, "Setup SHORT", "Setup short SweepFVG sur {{ticker}} à {{close}}")
+
+// ───────────────────────────── Stats ─────────────────────────────
+var table tbl = table.new(position.top_right, 3, 5, bgcolor = color.new(color.black, 80), border_width = 1)
+
+statCol(int col, string title, Stats st) =>
+    float wr = st.n > 0 ? st.win * 100.0 / st.n : 0.0
+    table.cell(tbl, col, 0, title, text_color = color.white, text_size = size.small)
+    table.cell(tbl, col, 1, str.tostring(st.n), text_color = color.white, text_size = size.small)
+    table.cell(tbl, col, 2, str.tostring(wr, "#.#") + " %", text_color = color.white, text_size = size.small)
+    table.cell(tbl, col, 3, str.tostring(st.r, "#.##") + " R", text_color = st.r >= 0 ? color.lime : color.red, text_size = size.small)
+
+if showStats and barstate.islast
+    table.cell(tbl, 0, 0, "", text_size = size.small)
+    table.cell(tbl, 0, 1, "Trades", text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 2, "Winrate", text_color = color.white, text_size = size.small)
+    table.cell(tbl, 0, 3, "Total", text_color = color.white, text_size = size.small)
+    statCol(1, "Longs", longSt)
+    statCol(2, "Shorts", shortSt)
+    if timeframe.in_seconds() > 60
+        table.cell(tbl, 0, 4, "⚠ Utiliser en 1m", text_color = color.orange, text_size = size.small)
