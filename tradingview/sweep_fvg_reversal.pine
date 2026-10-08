@@ -1,8 +1,8 @@
 //@version=6
 // Sweep → FVG HTF → Reversal  (v1)
-// Détecte : impulsion qui laisse une FVG 2m/3m/5m → retracement en micro-structure
-// inverse → sweep d'un micro swing + tap dans la FVG → entrée à la clôture de la
-// première bougie dans le sens du trade. SL sous le sweep, TP sur le high de l'impulsion.
+// Détecte : impulsion qui laisse une FVG 2m/3m/5m → retracement RAPIDE en micro-structure
+// inverse (micro low puis lower high) → UNE bougie qui sweep le micro low ET touche la FVG
+// → entrée à la clôture de la première bougie dans le sens du trade. SL sous le sweep, TP sur le high de l'impulsion.
 // À utiliser sur un graphique 1m.
 indicator("Sweep FVG Reversal [v1]", shorttitle = "SweepFVG", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
@@ -20,8 +20,10 @@ fvgMinSizeTicks = input.int(2, "Taille min d'une FVG (ticks)", minval = 0, group
 grpS = "Structure"
 pivLen         = input.int(1, "Force des swings (bougies de chaque côté)", minval = 1, maxval = 5, group = grpS)
 needLH         = input.bool(true, "Exiger un lower high dans le retracement", group = grpS)
-needBreak      = input.bool(true, "Exiger la cassure d'un micro low (sweep)", group = grpS)
-maxRetraceBars = input.int(40, "Durée max du retracement (bougies)", minval = 3, group = grpS)
+needBreak      = input.bool(true, "Exiger le sweep d'un micro low sur la bougie qui touche la FVG", group = grpS)
+firstTouch     = input.bool(true, "Premier contact avec la FVG uniquement", group = grpS)
+maxRetraceBars = input.int(15, "Durée max high → sweep (bougies 1m)", minval = 3, group = grpS, tooltip = "Retracement rapide : si le prix met plus longtemps à revenir dans la FVG, le setup est abandonné.")
+minEff         = input.float(0.25, "Efficacité min du retracement (0 = off)", minval = 0.0, maxval = 1.0, step = 0.05, group = grpS, tooltip = "Baisse nette du high au sweep ÷ somme des ranges des bougies. Un range (beaucoup de va-et-vient) donne une valeur basse et le setup est écarté.")
 maxWaitBars    = input.int(5, "Bougies max entre sweep et entrée", minval = 1, group = grpS)
 
 grpT = "Trade"
@@ -50,8 +52,10 @@ type Setup
     float impHigh
     int   impBar
     float microLow
+    int   microBar
     bool  lhSeen = false
-    bool  broke  = false
+    float rngSum = 0.0   // somme des ranges depuis le high (mesure du "range")
+    float lowSoFar       // plus bas depuis le high (pour le "premier contact")
     float sweepLow
     int   sweepBar
     Fvg   fvg
@@ -114,14 +118,15 @@ hasFvgBelow(array<Fvg> arr, float level) =>
             break
     res
 
-// FVG la plus récente touchée par la mèche, sans clôture à travers
-findTap(array<Fvg> arr, float l, float c, float level) =>
+// FVG la plus récente touchée par la mèche, sans clôture à travers.
+// prevMin (non na) = plus bas des bougies précédentes : la FVG doit être touchée pour la 1re fois.
+findTap(array<Fvg> arr, float l, float c, float level, float prevMin) =>
     Fvg res = na
     int n = arr.size()
     if n > 0
         for i = n - 1 to 0
             Fvg f = arr.get(i)
-            if f.top < level and l <= f.top and c >= f.bot
+            if f.top < level and l <= f.top and c >= f.bot and (na(prevMin) or prevMin > f.top)
                 res := f
                 break
     res
@@ -165,40 +170,55 @@ step(Setup s, Stats st, array<Fvg> fvgs, float sgn, float o, float h, float l, f
     //    (pivLen bougies sans le dépasser) et s'il a une FVG HTF en dessous.
     if s.state == 0
         if na(s.impHigh) or h > s.impHigh
-            s.impHigh := h
-            s.impBar  := bar_index
-        else if bar_index - s.impBar >= pivLen and hasFvgBelow(fvgs, s.impHigh)
-            s.state    := 1
-            s.microLow := na
-            s.lhSeen   := false
-            s.broke    := false
+            s.impHigh  := h
+            s.impBar   := bar_index
+            s.rngSum   := 0.0
+            s.lowSoFar := h
+        else
+            s.rngSum   += h - l
+            s.lowSoFar := math.min(s.lowSoFar, l)
+            if bar_index - s.impBar >= pivLen and hasFvgBelow(fvgs, s.impHigh)
+                s.state    := 1
+                s.microLow := na
+                s.microBar := na
+                s.lhSeen   := false
 
-    // 1) Retracement : lower high + micro low, puis cassure du micro low et tap FVG
+    // 1) Retracement : micro low → lower high (dans cet ordre), puis UNE bougie qui
+    //    casse le micro low ET touche la FVG (le sweep se fait au contact de la FVG)
     else if s.state == 1
         if h > s.impHigh
             // nouveau plus haut : l'impulsion continue, on repart de zéro
             s.impHigh  := h
             s.impBar   := bar_index
             s.microLow := na
+            s.microBar := na
             s.lhSeen   := false
-            s.broke    := false
+            s.rngSum   := 0.0
+            s.lowSoFar := h
         else if bar_index - s.impBar > maxRetraceBars or not hasFvgBelow(fvgs, s.impHigh)
             resetSetup(s)
         else
+            s.rngSum += h - l
             int pivBar = bar_index - pivLen
-            if not na(ph) and pivBar > s.impBar and ph < s.impHigh
-                s.lhSeen := true
-            if not na(pl) and pivBar > s.impBar and not s.broke
+            // dernier swing low du retracement = micro low ; il invalide le lower high précédent
+            if not na(pl) and pivBar > s.impBar
                 s.microLow := pl
-            if not s.broke and not na(s.microLow) and l < s.microLow and (s.lhSeen or not needLH)
-                s.broke := true
-            if s.broke or not needBreak
-                Fvg f = findTap(fvgs, l, c, s.impHigh)
+                s.microBar := pivBar
+                s.lhSeen   := false
+            // lower high : swing high sous le high d'impulsion, formé APRÈS le micro low
+            if not na(ph) and pivBar > s.impBar and ph < s.impHigh and not na(s.microBar) and pivBar > s.microBar
+                s.lhSeen := true
+            bool sweeps = not na(s.microLow) and l < s.microLow and (s.lhSeen or not needLH)
+            if sweeps or not needBreak
+                // retracement efficace (pas de range) : baisse nette ÷ somme des ranges
+                bool fast = minEff <= 0 or (s.rngSum > 0 and (s.impHigh - l) / s.rngSum >= minEff)
+                Fvg f = fast ? findTap(fvgs, l, c, s.impHigh, firstTouch ? s.lowSoFar : float(na)) : na
                 if not na(f)
                     s.state    := 2
                     s.sweepLow := l
                     s.sweepBar := bar_index
                     s.fvg      := f
+            s.lowSoFar := math.min(s.lowSoFar, l)
 
     // 2) Sweep fait → entrée à la clôture de la 1re bougie dans le sens du trade
     if s.state == 2

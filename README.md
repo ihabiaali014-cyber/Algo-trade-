@@ -7,9 +7,12 @@ Fichier : [`tradingview/sweep_fvg_reversal.pine`](tradingview/sweep_fvg_reversal
 ### Le pattern (version long, le short est le miroir)
 1. **Impulsion haussière** qui laisse une **FVG haussière** en 2m, 3m ou 5m.
    La FVG n'est retenue qu'une fois sa 3e bougie HTF clôturée, donc toujours *avant* l'entrée.
-2. **Retracement** en 1m : un *lower high* et un *micro low* se forment sous le high de l'impulsion.
-3. **Sweep** : le prix casse le micro low (fausse cassure baissière) et sa mèche **touche la FVG**
-   sans clôturer en dessous.
+2. **Retracement rapide** en 1m, sans range : un *micro low*, puis un *lower high* sous le high de
+   l'impulsion (dans cet ordre). Le retour vers la FVG doit se faire en 15 bougies max et de façon
+   directionnelle (filtre d'efficacité).
+3. **Sweep au contact de la FVG** : c'est **la même bougie** qui casse le micro low **et** touche la FVG
+   (premier contact uniquement), sans clôturer sous la FVG. Une cassure du micro low en dehors de la FVG
+   ne compte pas.
 4. **Entrée** à la **clôture de la première bougie haussière** après le sweep
    (la bougie du sweep elle-même compte si elle clôture verte).
 5. **SL** sous le plus bas du sweep (plus un buffer en ticks). **TP** sur le high de l'impulsion.
@@ -30,7 +33,10 @@ trades, le winrate et le total en R sur l'historique chargé.
 | FVG TF 1/2/3 | 2m / 3m / 5m | Unités de temps des FVG prises en compte |
 | Force des swings | 1 | Nombre de bougies de chaque côté pour valider un swing 1m |
 | Exiger un lower high | oui | Le retracement doit montrer une vraie micro-structure baissière |
-| Exiger la cassure d'un micro low | oui | Le sweep doit casser un swing low du retracement |
+| Exiger le sweep d'un micro low sur la bougie qui touche la FVG | oui | Le sweep et le tap de la FVG se font sur la même bougie |
+| Premier contact avec la FVG uniquement | oui | Si le prix est déjà entré dans la FVG avant, le setup est écarté |
+| Durée max high → sweep | 15 | Retracement rapide, sinon le setup est abandonné |
+| Efficacité min du retracement | 0.25 | Baisse nette ÷ somme des ranges. Plus c'est haut, plus on exclut les ranges (0 = désactivé) |
 | Bougies max entre sweep et entrée | 5 | Délai après lequel le setup est abandonné |
 | Buffer SL | 2 ticks | Marge sous le sweep |
 | RR minimum | 1.0 | Filtre les setups où le TP est trop proche |
