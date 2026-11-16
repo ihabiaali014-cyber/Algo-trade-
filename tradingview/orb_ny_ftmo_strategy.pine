@@ -1,0 +1,166 @@
+//@version=6
+// ORB New York [FTMO] — même logique que mt5/ORB_NY_FTMO.mq5, pour le backtest TradingView.
+// Graphique conseillé : 5 minutes sur MNQ1!, NQ1! ou un CFD Nasdaq (US100 / NAS100).
+// 1. Opening range = high / low de 9h30 à 9h45 (heure de New York).
+// 2. Filtres : taille du range entre X et Y fois l'ATR journalier, tendance journalière (clôture d'hier vs EMA20).
+// 3. Entrée quand une bougie CLÔTURE au-delà du range (première cassure fraîche) avant 12h00 NY.
+// 4. SL de l'autre côté du range (ou milieu) + buffer, TP = 3R, sortie forcée à 15h50 NY.
+strategy("ORB New York [FTMO]", shorttitle = "ORB-NY", overlay = true,
+     initial_capital = 100000, currency = currency.USD, pyramiding = 0,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.5,
+     slippage = 2, process_orders_on_close = false, max_boxes_count = 500)
+
+// ───────────────────────────── Inputs ─────────────────────────────
+grpR = "Risque"
+riskPct   = input.float(0.5, "Risque par trade (% de l'equity)", minval = 0.05, maxval = 2.0, step = 0.05, group = grpR)
+qtyStep   = input.float(1.0, "Pas de quantité (1 = futures, 0.01 = CFD)", minval = 0.0001, group = grpR)
+dirOpt    = input.string("Les deux", "Sens", options = ["Les deux", "Long", "Short"], group = grpR)
+maxTrades = input.int(1, "Trades max par jour", minval = 1, maxval = 5, group = grpR)
+
+grpH = "Horaires (heure de New York)"
+orSess    = input.session("0930-0945", "Opening range", group = grpH)
+entrySess = input.session("0945-1200", "Fenêtre d'entrée", group = grpH)
+closeSess = input.session("1550-1600", "Clôture forcée", group = grpH)
+tradeFri  = input.bool(true, "Trader le vendredi", group = grpH)
+
+grpS = "Signal"
+useTrend = input.bool(true, "Filtre de tendance journalier", group = grpS)
+emaLen   = input.int(20, "EMA journalière", minval = 2, group = grpS)
+atrLen   = input.int(14, "ATR journalier", minval = 2, group = grpS)
+minRng   = input.float(0.08, "Taille min du range (x ATR jour)", step = 0.01, group = grpS)
+maxRng   = input.float(0.50, "Taille max du range (x ATR jour)", step = 0.01, group = grpS)
+slMode   = input.string("Opposé", "Stop loss", options = ["Opposé", "Milieu"], group = grpS)
+slBuf    = input.float(0.02, "Buffer SL (x ATR jour)", step = 0.01, group = grpS)
+tpRR     = input.float(3.0, "Take profit en R (0 = sortie fin de journée)", minval = 0, step = 0.5, group = grpS)
+beRR     = input.float(0.0, "Break-even à X R (0 = off)", minval = 0, step = 0.5, group = grpS)
+
+grpF = "Garde-fous FTMO (simulés en clôture de bougie)"
+dailyLim = input.float(4.0, "Perte journalière max interne (% capital initial)", group = grpF)
+maxLim   = input.float(8.0, "Perte max interne (% capital initial)", group = grpF)
+showTbl  = input.bool(true, "Tableau de stats", group = grpF)
+
+tz = "America/New_York"
+
+// ───────────────────────────── Données journalières (sans repaint) ─────────────────────────────
+[dClose1, dEma1, dAtr1] = request.security(syminfo.tickerid, "D", [close[1], ta.ema(close, emaLen)[1], ta.atr(atrLen)[1]], lookahead = barmerge.lookahead_on)
+
+// ───────────────────────────── Sessions ─────────────────────────────
+inOR    = not na(time(timeframe.period, orSess, tz))
+inEntry = not na(time(timeframe.period, entrySess, tz))
+inClose = not na(time(timeframe.period, closeSess, tz))
+nyDay   = dayofmonth(time, tz)
+newDay  = nyDay != nyDay[1]
+isFri   = dayofweek(time, tz) == dayofweek.friday
+
+var float orH = na
+var float orL = na
+var int   tradesToday = 0
+var float tSL = na
+var float tTP = na
+var float tRisk = na
+
+// FTMO
+var float initCap  = strategy.initial_capital
+var float dayStart = strategy.initial_capital
+var bool  haltDay  = false
+var bool  haltAll  = false
+var float worstDay = 0.0
+
+if newDay
+    worstDay    := math.min(worstDay, (strategy.equity[1] - dayStart) / initCap * 100)
+    dayStart    := strategy.equity[1]
+    haltDay     := false
+    orH         := na
+    orL         := na
+    tradesToday := 0
+
+if inOR
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low : math.min(orL, low)
+
+orReady = not inOR and not na(orH)
+rng     = orH - orL
+rngOK   = orReady and rng >= minRng * dAtr1 and rng <= maxRng * dAtr1
+
+// Garde-fous FTMO
+if strategy.equity <= dayStart - initCap * dailyLim / 100 and not haltDay
+    haltDay := true
+    strategy.close_all("Stop jour FTMO")
+if strategy.equity <= initCap * (1 - maxLim / 100) and not haltAll
+    haltAll := true
+    strategy.close_all("Stop max FTMO")
+
+// ───────────────────────────── Signal ─────────────────────────────
+bullBreak = orReady and close > orH and close[1] <= orH
+bearBreak = orReady and close < orL and close[1] >= orL
+trendUp   = not useTrend or dClose1 > dEma1
+trendDn   = not useTrend or dClose1 < dEma1
+canTrade  = rngOK and inEntry and strategy.position_size == 0 and tradesToday < maxTrades and not haltDay and not haltAll and (tradeFri or not isFri)
+
+buf = slBuf * dAtr1
+mid = (orH + orL) / 2
+
+if canTrade and bullBreak and trendUp and dirOpt != "Short"
+    sl   = (slMode == "Opposé" ? orL : mid) - buf
+    dist = close - sl
+    qty  = math.floor(strategy.equity * riskPct / 100 / (dist * syminfo.pointvalue) / qtyStep) * qtyStep
+    if dist > 0 and qty >= qtyStep
+        tSL   := sl
+        tTP   := tpRR > 0 ? close + dist * tpRR : na
+        tRisk := dist
+        strategy.entry("Long", strategy.long, qty)
+        strategy.exit("Long x", "Long", stop = tSL, limit = tTP)
+        tradesToday += 1
+
+if canTrade and bearBreak and trendDn and dirOpt != "Long"
+    sl   = (slMode == "Opposé" ? orH : mid) + buf
+    dist = sl - close
+    qty  = math.floor(strategy.equity * riskPct / 100 / (dist * syminfo.pointvalue) / qtyStep) * qtyStep
+    if dist > 0 and qty >= qtyStep
+        tSL   := sl
+        tTP   := tpRR > 0 ? close - dist * tpRR : na
+        tRisk := dist
+        strategy.entry("Short", strategy.short, qty)
+        strategy.exit("Short x", "Short", stop = tSL, limit = tTP)
+        tradesToday += 1
+
+// Break-even
+if beRR > 0 and strategy.position_size > 0 and tSL < strategy.position_avg_price and high >= strategy.position_avg_price + beRR * tRisk
+    tSL := strategy.position_avg_price
+    strategy.exit("Long x", "Long", stop = tSL, limit = tTP)
+if beRR > 0 and strategy.position_size < 0 and tSL > strategy.position_avg_price and low <= strategy.position_avg_price - beRR * tRisk
+    tSL := strategy.position_avg_price
+    strategy.exit("Short x", "Short", stop = tSL, limit = tTP)
+
+// Sortie de fin de journée
+if inClose
+    strategy.close_all("Fin de journée")
+
+// ───────────────────────────── Affichage ─────────────────────────────
+plot(orReady ? orH : na, "OR high", color.new(color.teal, 0), 1, plot.style_linebr)
+plot(orReady ? orL : na, "OR low", color.new(color.maroon, 0), 1, plot.style_linebr)
+bgcolor(inOR ? color.new(color.blue, 90) : na, title = "Opening range")
+plot(strategy.position_size != 0 ? tSL : na, "SL", color.red, 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? tTP : na, "TP", color.green, 1, plot.style_linebr)
+
+if showTbl and barstate.islastconfirmedhistory
+    curDay = (strategy.equity - dayStart) / initCap * 100
+    wDay   = math.min(worstDay, curDay)
+    n      = strategy.closedtrades
+    pf     = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    ddPct  = strategy.max_drawdown / initCap * 100
+    t = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 20), border_width = 1)
+    table.cell(t, 0, 0, "Trades", text_color = color.white)
+    table.cell(t, 1, 0, str.tostring(n), text_color = color.white)
+    table.cell(t, 0, 1, "Winrate", text_color = color.white)
+    table.cell(t, 1, 1, n > 0 ? str.tostring(strategy.wintrades / n * 100, "#.0") + " %" : "-", text_color = color.white)
+    table.cell(t, 0, 2, "Profit factor", text_color = color.white)
+    table.cell(t, 1, 2, na(pf) ? "-" : str.tostring(pf, "#.00"), text_color = color.white)
+    table.cell(t, 0, 3, "Net", text_color = color.white)
+    table.cell(t, 1, 3, str.tostring(strategy.netprofit / initCap * 100, "#.00") + " %", text_color = color.white)
+    table.cell(t, 0, 4, "Drawdown max", text_color = color.white)
+    table.cell(t, 1, 4, str.tostring(ddPct, "#.00") + " %", text_color = ddPct >= 10 ? color.red : color.white)
+    table.cell(t, 0, 5, "Pire journée", text_color = color.white)
+    table.cell(t, 1, 5, str.tostring(wDay, "#.00") + " %", text_color = wDay <= -5 ? color.red : color.white)
+    table.cell(t, 0, 6, "Limites FTMO", text_color = color.white)
+    table.cell(t, 1, 6, ddPct < 10 and wDay > -5 ? "respectées" : "DÉPASSÉES", text_color = ddPct < 10 and wDay > -5 ? color.lime : color.red)

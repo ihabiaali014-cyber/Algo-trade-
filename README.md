@@ -1,5 +1,16 @@
 # Algo-trade
 
+## ORB New York : EA conforme FTMO (MT5 + TradingView)
+
+Opening Range Breakout sur l'ouverture de New York (US100 / NQ) : range 9h30-9h45, cassure confirmée
+en M5 dans le sens de la tendance journalière, SL de l'autre côté du range, TP 3R, sortie à 15h50,
+0,5 % de risque et garde-fous FTMO (perte journalière, perte max, news).
+
+- EA MetaTrader 5 : [`mt5/ORB_NY_FTMO.mq5`](mt5/ORB_NY_FTMO.mq5)
+- Stratégie TradingView pour le backtest : [`tradingview/orb_ny_ftmo_strategy.pine`](tradingview/orb_ny_ftmo_strategy.pine)
+- Règles, conformité FTMO, installation et protocole de backtest (MT5, TradingView, FX Replay) :
+  [`docs/ORB_NY_FTMO.md`](docs/ORB_NY_FTMO.md)
+
 ## Sweep → FVG HTF → Reversal (v1, indicateur TradingView)
 
 Fichier : [`tradingview/sweep_fvg_reversal.pine`](tradingview/sweep_fvg_reversal.pine)
